@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+
+  /* Primary — Amber/Gold from Stitch */
+  --color-primary: #eaa917;
+  --color-primary-dark: #b8860b;
+  --color-primary-light: #f6c85e;
+
+  /* Backgrounds — Light mode default (warm off-white) */
+  --color-bg: #f8f7f6;
+  --color-bg-dark: #221c10;
+
+  /* Surfaces */
+  --color-surface: #ffffff;
+  --color-surface-alt: #f5f4f2;
+  --color-surface-dark: #2d261a;
+  --color-surface-border: #453b2a;
+
+  /* Neutrals */
+  --color-neutral-light: #e8e6e1;
+  --color-neutral-dark: #1a160d;
+
+  /* Service role colors */
+  --color-role-db: #3b82f6;
+  --color-role-web: #10b981;
+  --color-role-app: #8b5cf6;
+
+  /* Status */
+  --color-success: #10b981;
+  --color-danger: #ef4444;
+  --color-info: #60a5fa;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #f8f7f6; }
+::-webkit-scrollbar-thumb { background: #e8e6e1; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #d5d3ce; }
+
+/* Base */
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-bg);
+  color: #0f172a; /* slate-900 */
+  margin: 0;
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in { animation: fadeIn 200ms ease-out; }
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 10px 0px rgba(234, 169, 23, 0.3); }
+  50% { box-shadow: 0 0 20px 5px rgba(234, 169, 23, 0.5); }
+}
+.animate-glow { animation: pulseGlow 3s infinite; }
+
+@keyframes bloomExpand {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.bloom-container { animation: bloomExpand 0.5s ease-out forwards; }
+
+/* Grid background for login & map */
+.bg-grid {
+  background-image:
+    linear-gradient(#453b2a20 1px, transparent 1px),
+    linear-gradient(90deg, #453b2a20 1px, transparent 1px);
+  background-size: 60px 60px;
+}
+
+/* Cytoscape */
+.cytoscape-canvas { width: 100%; height: 100%; display: block; }

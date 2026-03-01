@@ -1,0 +1,18 @@
+[project]
+name = "aws-vpc-flow-logs-visualizer-backend"
+version = "0.1.0"
+description = "Django DRF backend for AWS VPC flow log ingestion, correlation, enrichment, and visualization APIs."
+authors = [{ name = "Jermaine B" }]
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "django>=5.1,<6.0",
+    "djangorestframework>=3.16,<4.0",
+    "django-cors-headers>=4.6,<5.0",
+]
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

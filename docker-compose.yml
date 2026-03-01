@@ -1,0 +1,11 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aws-vpc-flow-logs-visualizer:local
+    ports:
+      - "8000:8000"
+    environment:
+      DJANGO_ALLOWED_HOSTS: "*"
+      CORS_ALLOW_ALL_ORIGINS: "true"
