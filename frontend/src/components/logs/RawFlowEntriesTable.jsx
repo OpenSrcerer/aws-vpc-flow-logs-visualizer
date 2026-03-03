@@ -2,7 +2,7 @@ import { Fragment, useState } from "react";
 import Icon from "../Icon";
 import { formatBytes, formatInt } from "../../lib/graph";
 
-const PROTOCOL_NAMES = { 1: "ICMP", 6: "TCP", 17: "UDP" };
+const PROTOCOL_NAMES = { 1: "ICMP", 4: "IPIP", 6: "TCP", 17: "UDP" };
 
 function formatTimestamp(value) {
   if (!value) return "-";

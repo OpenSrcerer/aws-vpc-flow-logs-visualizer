@@ -87,6 +87,7 @@ function withPagination(path, params = {}, defaultPageSize = 250) {
 
 export const api = {
   getHealth: () => request("/health/"),
+  getDashboardSummary: () => request("/dashboard/summary/"),
   listFlowLogs: (params = {}) => {
     const query = new URLSearchParams();
     query.set("page_size", String(params.page_size || 100));

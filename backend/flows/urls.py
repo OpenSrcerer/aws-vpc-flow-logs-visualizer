@@ -5,6 +5,7 @@ from .views import (
     AdvancedFlowFilterValidateView,
     CorrelatedFlowViewSet,
     CorrelationRebuildView,
+    DashboardSummaryView,
     FirewallRecommendationView,
     FlowLogEntryViewSet,
     FlowLogImportListView,
@@ -29,6 +30,7 @@ router.register("network-groups", NetworkGroupViewSet, basename="network-groups"
 urlpatterns = [
     path("", include(router.urls)),
     path("health/", HealthView.as_view(), name="health"),
+    path("dashboard/summary/", DashboardSummaryView.as_view(), name="dashboard-summary"),
     path("search/", GlobalSearchView.as_view(), name="global-search"),
     path("uploads/flow-logs/", FlowLogUploadView.as_view(), name="upload-flow-logs"),
     path("metadata/import/", IpMetadataImportView.as_view(), name="import-ip-metadata"),

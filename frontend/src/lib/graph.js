@@ -75,6 +75,52 @@ export const LAYOUT_PRESETS = {
   },
 };
 
+function trafficOf(node) {
+  return (node?.bytes_in || 0) + (node?.bytes_out || 0);
+}
+
+function countGrouped(nodes) {
+  let total = 0;
+  for (const node of nodes) {
+    if (node?.group) total += 1;
+  }
+  return total;
+}
+
+function trimToLimitWithGroupedQuota(nodes, limit, minGrouped) {
+  const selected = [...nodes];
+  while (selected.length > limit) {
+    const groupedCount = countGrouped(selected);
+    let removeIndex = -1;
+    let minTraffic = Infinity;
+
+    for (let idx = 0; idx < selected.length; idx += 1) {
+      const node = selected[idx];
+      const isGrouped = Boolean(node?.group);
+      if (isGrouped && groupedCount <= minGrouped) continue;
+      const traffic = trafficOf(node);
+      if (traffic < minTraffic) {
+        minTraffic = traffic;
+        removeIndex = idx;
+      }
+    }
+
+    if (removeIndex === -1) {
+      for (let idx = 0; idx < selected.length; idx += 1) {
+        const traffic = trafficOf(selected[idx]);
+        if (traffic < minTraffic) {
+          minTraffic = traffic;
+          removeIndex = idx;
+        }
+      }
+    }
+
+    if (removeIndex < 0) break;
+    selected.splice(removeIndex, 1);
+  }
+  return selected;
+}
+
 /**
  * Build a Cytoscape element model with compound (parent) nodes for groups.
  *
@@ -94,7 +140,41 @@ export function buildGraphModel(
   const sortedNodes = [...allNodes].sort(
     (a, b) => b.bytes_in + b.bytes_out - (a.bytes_in + a.bytes_out)
   );
-  const selectedNodes = sortedNodes.slice(0, nodeLimit);
+  const groupedNodesSorted = sortedNodes.filter((node) => Boolean(node?.group));
+  const groupBestByName = new Map();
+  for (const node of groupedNodesSorted) {
+    if (!groupBestByName.has(node.group)) {
+      groupBestByName.set(node.group, node);
+    }
+  }
+
+  const groupedPriority = [
+    ...groupBestByName.values(),
+    ...groupedNodesSorted.filter((node) => !groupBestByName.has(node.group) || groupBestByName.get(node.group)?.id !== node.id),
+  ];
+
+  let selectedNodes = sortedNodes.slice(0, nodeLimit);
+  if (groupedPriority.length > 0 && nodeLimit > 0) {
+    const selectedIds = new Set(selectedNodes.map((node) => node.id));
+    const minGroupedNodes = Math.min(
+      groupedNodesSorted.length,
+      Math.max(1, Math.min(groupBestByName.size, Math.floor(nodeLimit * 0.2)))
+    );
+
+    let groupedCount = countGrouped(selectedNodes);
+    if (groupedCount < minGroupedNodes) {
+      for (const node of groupedPriority) {
+        if (groupedCount >= minGroupedNodes) break;
+        if (selectedIds.has(node.id)) continue;
+        selectedNodes.push(node);
+        selectedIds.add(node.id);
+        groupedCount += 1;
+      }
+      selectedNodes = trimToLimitWithGroupedQuota(selectedNodes, nodeLimit, minGroupedNodes);
+      selectedNodes.sort((a, b) => trafficOf(b) - trafficOf(a));
+    }
+  }
+
   const allowedIds = new Set(selectedNodes.map((n) => n.id));
 
   // Filter & cap edges

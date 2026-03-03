@@ -1,37 +1,96 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, extractResults } from "../lib/api";
+import { api } from "../lib/api";
 import { formatBytes, formatInt } from "../lib/graph";
 import Icon from "../components/Icon";
 
-const PROTOCOL_LABELS = { 1: "ICMP", 6: "TCP", 17: "UDP" };
+const PROTOCOL_LABELS = { 1: "ICMP", 4: "IPIP", 6: "TCP", 17: "UDP" };
+
+function SkeletonRow() {
+  return (
+    <div className="flex items-center justify-between gap-3 py-0.5 animate-pulse">
+      <div className="h-3 rounded bg-slate-200 w-2/3" />
+      <div className="h-3 rounded bg-slate-200 w-16" />
+    </div>
+  );
+}
+
+function SkeletonMetric() {
+  return <div className="h-5 mt-1 rounded bg-slate-200 w-20 animate-pulse" />;
+}
 
 export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
+  const [loadingState, setLoadingState] = useState({
+    health: true,
+    mesh: true,
+    summary: true,
+  });
   const [error, setError] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
   const [health, setHealth] = useState(null);
   const [mesh, setMesh] = useState({ nodes: [], edges: [] });
-  const [correlatedFlows, setCorrelatedFlows] = useState([]);
+  const [summary, setSummary] = useState({
+    traffic: { total_bytes: 0, total_packets: 0, total_sessions: 0 },
+    protocol_breakdown: [],
+  });
 
   const fetchDashboard = useCallback(async () => {
     setLoading(true);
     setError("");
-    try {
-      const [healthRes, meshRes, correlatedRes] = await Promise.all([
-        api.getHealth(),
-        api.getMesh(),
-        api.listCorrelatedFlows(),
-      ]);
-      setHealth(healthRes);
-      setMesh(meshRes);
-      setCorrelatedFlows(extractResults(correlatedRes));
-      setLastUpdated(new Date());
-    } catch (err) {
-      setError(err.message || "Failed to load dashboard data");
-    } finally {
-      setLoading(false);
+    setLoadingState({ health: true, mesh: true, summary: true });
+
+    const errors = [];
+    let hadSuccess = false;
+
+    const healthRequest = api.getHealth()
+      .then((healthRes) => {
+        hadSuccess = true;
+        setHealth(healthRes);
+      })
+      .catch((err) => {
+        errors.push(`Health: ${err.message || "request failed"}`);
+      })
+      .finally(() => {
+        setLoadingState((current) => ({ ...current, health: false }));
+      });
+
+    const meshRequest = api.getMesh()
+      .then((meshRes) => {
+        hadSuccess = true;
+        setMesh(meshRes || { nodes: [], edges: [] });
+      })
+      .catch((err) => {
+        errors.push(`Topology: ${err.message || "request failed"}`);
+      })
+      .finally(() => {
+        setLoadingState((current) => ({ ...current, mesh: false }));
+      });
+
+    const summaryRequest = api.getDashboardSummary()
+      .then((summaryRes) => {
+        hadSuccess = true;
+        setSummary(summaryRes || {
+          traffic: { total_bytes: 0, total_packets: 0, total_sessions: 0 },
+          protocol_breakdown: [],
+        });
+      })
+      .catch((err) => {
+        errors.push(`Summary: ${err.message || "request failed"}`);
+      })
+      .finally(() => {
+        setLoadingState((current) => ({ ...current, summary: false }));
+      });
+
+    await Promise.all([healthRequest, meshRequest, summaryRequest]);
+
+    if (errors.length > 0) {
+      setError(errors.join(" | "));
     }
+    if (hadSuccess) {
+      setLastUpdated(new Date());
+    }
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -39,27 +98,20 @@ export default function DashboardPage() {
   }, [fetchDashboard]);
 
   const trafficSummary = useMemo(() => {
-    const totalBytes = correlatedFlows.reduce(
-      (acc, f) => acc + f.c2s_bytes + f.s2c_bytes,
-      0
-    );
-    return { totalBytes };
-  }, [correlatedFlows]);
+    return { totalBytes: summary?.traffic?.total_bytes || 0 };
+  }, [summary]);
 
   const protocolBreakdown = useMemo(() => {
-    const byProtocol = {};
-    for (const flow of correlatedFlows) {
-      const key = String(flow.protocol);
-      if (!byProtocol[key]) {
-        byProtocol[key] = {
-          protocol: PROTOCOL_LABELS[flow.protocol] || String(flow.protocol),
-          bytes: 0,
-        };
-      }
-      byProtocol[key].bytes += flow.c2s_bytes + flow.s2c_bytes;
-    }
-    return Object.values(byProtocol).sort((a, b) => b.bytes - a.bytes).slice(0, 6);
-  }, [correlatedFlows]);
+    const rows = Array.isArray(summary?.protocol_breakdown)
+      ? summary.protocol_breakdown
+      : [];
+    return rows
+      .map((row) => ({
+        protocol: PROTOCOL_LABELS[row.protocol] || String(row.protocol),
+        bytes: row.bytes || 0,
+      }))
+      .slice(0, 6);
+  }, [summary]);
 
   const topConversations = useMemo(
     () =>
@@ -118,29 +170,34 @@ export default function DashboardPage() {
         label: "Raw Flows",
         value: formatInt(health?.flow_log_entries ?? 0),
         icon: "stacks",
+        dataLoading: loadingState.health,
       },
       {
         label: "Correlated Sessions",
         value: formatInt(health?.correlated_flows ?? 0),
         icon: "link",
+        dataLoading: loadingState.health,
       },
       {
         label: "IP Assets",
         value: formatInt(health?.ip_metadata ?? 0),
         icon: "dns",
+        dataLoading: loadingState.health,
       },
       {
         label: "Network Groups",
         value: formatInt(health?.network_groups ?? 0),
         icon: "account_tree",
+        dataLoading: loadingState.health,
       },
       {
         label: "Observed Traffic",
         value: formatBytes(trafficSummary.totalBytes),
         icon: "data_usage",
+        dataLoading: loadingState.summary,
       },
     ],
-    [health, trafficSummary.totalBytes]
+    [health, loadingState.health, loadingState.summary, trafficSummary.totalBytes]
   );
 
   return (
@@ -157,12 +214,18 @@ export default function DashboardPage() {
             <span className="text-xs text-slate-500">
               Updated: <span className="font-medium text-slate-700">{lastUpdated ? lastUpdated.toLocaleTimeString() : "-"}</span>
             </span>
+            {loading && (
+              <span className="inline-flex items-center gap-1 text-xs text-slate-500">
+                <Icon name="refresh" size={12} className="animate-spin" />
+                Loading data...
+              </span>
+            )}
             <button
               onClick={fetchDashboard}
               disabled={loading}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-600 border border-neutral-300 hover:bg-neutral-100 transition-colors disabled:opacity-50"
             >
-              <Icon name="refresh" size={14} />
+              <Icon name="refresh" size={14} className={loading ? "animate-spin" : ""} />
               Refresh
             </button>
             <Link
@@ -195,7 +258,7 @@ export default function DashboardPage() {
               <Icon name={metric.icon} size={14} className="text-primary" />
             </div>
             <div className="text-base font-semibold text-slate-900 mt-1 truncate">
-              {loading ? "..." : metric.value}
+              {metric.dataLoading ? <SkeletonMetric /> : metric.value}
             </div>
           </div>
         ))}
@@ -209,7 +272,13 @@ export default function DashboardPage() {
             </h3>
             <span className="text-[11px] text-slate-400">By bytes</span>
           </div>
-          {topConversations.length === 0 ? (
+          {loadingState.mesh ? (
+            <div className="space-y-1.5 py-0.5">
+              {Array.from({ length: 6 }).map((_, idx) => (
+                <SkeletonRow key={`top-conv-skeleton-${idx}`} />
+              ))}
+            </div>
+          ) : topConversations.length === 0 ? (
             <p className="text-xs text-slate-400 py-3">No correlated traffic yet.</p>
           ) : (
             <div className="space-y-1.5">
@@ -242,7 +311,13 @@ export default function DashboardPage() {
             </h3>
             <span className="text-[11px] text-slate-400">Top 6</span>
           </div>
-          {protocolBreakdown.length === 0 ? (
+          {loadingState.summary ? (
+            <div className="space-y-1.5 py-0.5">
+              {Array.from({ length: 6 }).map((_, idx) => (
+                <SkeletonRow key={`protocol-skeleton-${idx}`} />
+              ))}
+            </div>
+          ) : protocolBreakdown.length === 0 ? (
             <p className="text-xs text-slate-400 py-3">No protocol data yet.</p>
           ) : (
             <div className="space-y-1.5">
@@ -266,7 +341,20 @@ export default function DashboardPage() {
           </h3>
           <span className="text-[11px] text-slate-400">By service + port</span>
         </div>
-        {topServices.length === 0 ? (
+        {loadingState.mesh ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-1.5">
+            {Array.from({ length: 6 }).map((_, idx) => (
+              <div
+                key={`service-skeleton-${idx}`}
+                className="px-2 py-1.5 rounded border border-neutral-200 bg-neutral-50/40 text-xs animate-pulse"
+              >
+                <div className="h-3 rounded bg-slate-200 w-2/3 mb-2" />
+                <div className="h-3 rounded bg-slate-200 w-1/3 mb-2" />
+                <div className="h-3 rounded bg-slate-200 w-full" />
+              </div>
+            ))}
+          </div>
+        ) : topServices.length === 0 ? (
           <p className="text-xs text-slate-400 py-3">No service data yet.</p>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-1.5">

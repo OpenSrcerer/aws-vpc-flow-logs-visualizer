@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass, field
+from heapq import nlargest
 from typing import Iterable
 
 from django.db import transaction
@@ -30,6 +31,14 @@ FIREWALL_SIM_GROUP_TAG = "firewall-simulator"
 FIREWALL_SIM_SOURCE_PREFIX = "[FIREWALL_SIM_SOURCE]"
 
 
+def _iter_flows(flows: Iterable[CorrelatedFlow], *, chunk_size: int = 2000):
+    iterator = getattr(flows, "iterator", None)
+    if callable(iterator):
+        yield from iterator(chunk_size=chunk_size)
+        return
+    yield from flows
+
+
 def protocol_to_name(protocol: int) -> str:
     if protocol == 6:
         return "tcp"
@@ -37,6 +46,8 @@ def protocol_to_name(protocol: int) -> str:
         return "udp"
     if protocol == 1:
         return "icmp"
+    if protocol == 4:
+        return "ipip"
     return str(protocol)
 
 
@@ -344,14 +355,18 @@ def _tag_map(value) -> dict[str, str]:
     return {}
 
 
-def build_mesh_payload(flows: Iterable[CorrelatedFlow]) -> dict[str, list[dict]]:
+def build_mesh_payload(
+    flows: Iterable[CorrelatedFlow],
+    *,
+    edge_limit: int | None = None,
+) -> dict[str, list[dict]]:
     metadata_by_ip = {meta.ip_address: meta for meta in IpMetadata.objects.all()}
     network_groups = _load_network_group_index(exclude_firewall_sim=True)
 
     nodes: dict[str, dict] = {}
     edges: dict[tuple, dict] = {}
 
-    for flow in flows:
+    for flow in _iter_flows(flows):
         consumer_ip = flow.client_ip
         provider_ip = flow.server_ip
 
@@ -447,10 +462,16 @@ def build_mesh_payload(flows: Iterable[CorrelatedFlow]) -> dict[str, list[dict]]
         edge["packets"] += total_packets
         edge["flows"] += flow.flow_count
 
-    return {
-        "nodes": sorted(nodes.values(), key=lambda item: item["bytes_in"] + item["bytes_out"], reverse=True),
-        "edges": sorted(edges.values(), key=lambda item: item["bytes"], reverse=True),
-    }
+    if edge_limit is not None and edge_limit > 0:
+        sorted_nodes = list(nodes.values())
+    else:
+        sorted_nodes = sorted(nodes.values(), key=lambda item: item["bytes_in"] + item["bytes_out"], reverse=True)
+    if edge_limit is not None and edge_limit > 0:
+        sorted_edges = nlargest(edge_limit, edges.values(), key=lambda item: item["bytes"])
+    else:
+        sorted_edges = sorted(edges.values(), key=lambda item: item["bytes"], reverse=True)
+
+    return {"nodes": sorted_nodes, "edges": sorted_edges}
 
 
 def build_firewall_recommendations(
@@ -463,7 +484,7 @@ def build_firewall_recommendations(
 
     aggregated_rules: dict[tuple, dict] = {}
 
-    for flow in flows:
+    for flow in _iter_flows(flows):
         total_bytes = flow.c2s_bytes + flow.s2c_bytes
         if total_bytes < min_bytes:
             continue

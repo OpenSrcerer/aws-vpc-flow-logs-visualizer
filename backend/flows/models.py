@@ -19,14 +19,16 @@ class FlowLogEntry(models.Model):
     end_time = models.DateTimeField(db_index=True)
     action = models.CharField(max_length=16, db_index=True)
     log_status = models.CharField(max_length=32, blank=True)
-    source = models.CharField(max_length=128, blank=True)
+    source = models.CharField(max_length=128, blank=True, db_index=True)
     raw_line = models.TextField(blank=True)
-    ingested_at = models.DateTimeField(auto_now_add=True)
+    ingested_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
         indexes = [
             models.Index(fields=["srcaddr", "dstaddr", "protocol"]),
             models.Index(fields=["start_time", "end_time"]),
+            models.Index(fields=["start_time", "id"]),
+            models.Index(fields=["source", "start_time"]),
         ]
 
     def __str__(self) -> str:
@@ -53,7 +55,7 @@ class CorrelatedFlow(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["client_ip", "server_ip", "protocol"]),
-            models.Index(fields=["last_seen"]),
+            models.Index(fields=["last_seen", "id"]),
         ]
 
     def __str__(self) -> str:

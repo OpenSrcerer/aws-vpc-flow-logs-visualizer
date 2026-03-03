@@ -5,6 +5,7 @@ import { formatBytes, formatInt } from "../lib/graph";
 
 const PROTOCOL_NAMES = {
   1: "ICMP",
+  4: "IPIP",
   6: "TCP",
   17: "UDP",
 };
@@ -271,7 +272,7 @@ export default function SearchPage() {
 
       {!loading && query && (
         <div className="text-xs text-slate-500">
-          Tip: refine by protocol names (`tcp`, `udp`, `icmp`), exact IPs, ports, tags, or group names.
+          Tip: refine by protocol names (`tcp`, `udp`, `icmp`, `ipip`), exact IPs, ports, tags, or group names.
           {" "}
           <Link className="text-primary hover:text-primary-dark" to="/logs">
             Open Logs

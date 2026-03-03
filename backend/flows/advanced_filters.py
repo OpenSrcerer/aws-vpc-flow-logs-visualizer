@@ -5,6 +5,8 @@ import ipaddress
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from django.db.models import Q
+
 
 class AdvancedFilterError(ValueError):
     pass
@@ -51,6 +53,10 @@ INT_FIELDS = {"srcport", "dstport", "protocol"}
 STR_FIELDS = {"action", "source", "interface_id", "log_status"}
 PROTOCOL_NAME_TO_NUMBER = {
     "icmp": 1,
+    "ipip": 4,
+    "ip-in-ip": 4,
+    "ip_in_ip": 4,
+    "ipinip": 4,
     "tcp": 6,
     "udp": 17,
 }
@@ -502,4 +508,74 @@ def evaluate_advanced_filter(ast: dict[str, Any], row: dict[str, Any]) -> bool:
         return evaluate_advanced_filter(ast["left"], row) and evaluate_advanced_filter(ast["right"], row)
     if node_type == "or":
         return evaluate_advanced_filter(ast["left"], row) or evaluate_advanced_filter(ast["right"], row)
+    raise AdvancedFilterError(f"Unsupported AST node type '{node_type}'.")
+
+
+def _compile_condition_to_q(condition: dict[str, Any]) -> Q | None:
+    op = "==" if condition["op"] == "=" else condition["op"]
+    if op not in {"==", "!="}:
+        raise AdvancedFilterError(f"Unsupported operator '{condition['op']}'. Only =, ==, and != are supported.")
+
+    field_ref = _normalize_field(str(condition["field"]))
+    if field_ref.source != "raw":
+        return None
+
+    value_kind, value = _parse_condition_value(field_ref, str(condition["value"]))
+    field_name = field_ref.name
+
+    if value_kind in {"int", "ip"}:
+        compiled_match = Q(**{field_name: value})
+    elif value_kind == "str":
+        compiled_match = Q(**{f"{field_name}__iexact": str(value)})
+    else:
+        # CIDR and wildcard filters are evaluated in Python for compatibility
+        # across SQLite/PostgreSQL deployments.
+        return None
+
+    if op == "==":
+        return compiled_match
+
+    # Python evaluator treats NULL row values as "not equal"; preserve that
+    # behavior in SQL by explicitly including NULLs.
+    return Q(**{f"{field_name}__isnull": True}) | ~compiled_match
+
+
+def build_prefilter_q_from_advanced_filter_ast(ast: dict[str, Any]) -> Q | None:
+    """
+    Best-effort compiler from advanced-filter AST to Django Q objects.
+
+    Returns a safe prefilter Q expression when possible:
+    - fully compilable expressions return exact semantics
+    - partially compilable `AND` expressions return a narrowing prefilter
+    - expressions that cannot be compiled safely return None
+    """
+    node_type = ast.get("type")
+    if node_type == "condition":
+        return _compile_condition_to_q(ast)
+
+    if node_type == "and":
+        left = build_prefilter_q_from_advanced_filter_ast(ast["left"])
+        right = build_prefilter_q_from_advanced_filter_ast(ast["right"])
+        if left is None:
+            return right
+        if right is None:
+            return left
+        return left & right
+
+    if node_type == "or":
+        left = build_prefilter_q_from_advanced_filter_ast(ast["left"])
+        right = build_prefilter_q_from_advanced_filter_ast(ast["right"])
+        if left is None or right is None:
+            return None
+        return left | right
+
+    raise AdvancedFilterError(f"Unsupported AST node type '{node_type}'.")
+
+
+def advanced_filter_can_run_in_db(ast: dict[str, Any]) -> bool:
+    node_type = ast.get("type")
+    if node_type == "condition":
+        return _compile_condition_to_q(ast) is not None
+    if node_type in {"and", "or"}:
+        return advanced_filter_can_run_in_db(ast["left"]) and advanced_filter_can_run_in_db(ast["right"])
     raise AdvancedFilterError(f"Unsupported AST node type '{node_type}'.")

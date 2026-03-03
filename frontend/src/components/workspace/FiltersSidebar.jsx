@@ -6,6 +6,7 @@ const PROTOCOLS = [
   { value: "6", label: "TCP (6)" },
   { value: "17", label: "UDP (17)" },
   { value: "1", label: "ICMP (1)" },
+  { value: "4", label: "IP-in-IP (4)" },
 ];
 
 const TIME_RANGES = [
