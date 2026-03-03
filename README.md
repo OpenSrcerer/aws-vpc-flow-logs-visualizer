@@ -177,10 +177,12 @@ docker run -d --name aws-vpc-flow-logs-visualizer --restart unless-stopped -p 80
   - accepts multipart `file`, repeated `files` (bulk), or text `lines`
   - file supports plain text flow logs and gzip-compressed `.log.gz`
   - optional: `source`, `auto_correlate=true|false`
+  - optional: `log_format` (space-separated fields, defaults to `version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status`)
 - `POST /api/correlation/rebuild/`
 - `GET /api/flow-logs/`
   - optional advanced expression filter with `advanced_filter`, e.g.
     `((addr.src == 10.108.1.1) or (addr.dst == 10.108.1.1)) and (protocol == icmp) and (port.dst == 80)`
+  - protocol names accepted in advanced filters: `icmp`, `ipip`, `tcp`, `udp` (or numeric values)
   - supports asset metadata fields like `instance.owner=4442424324`, `instance.name=*aws*`, `instance.region=us-east-1`, `instance.az=us-east-1d`, and `instance.tags.environment="prod"` (`asset.*` is an alias)
 - `GET /api/correlated-flows/`
 - `GET/POST /api/ip-metadata/`
@@ -209,6 +211,7 @@ Network groups support either a single `cidr` or a `cidrs` list:
 curl -X POST http://localhost:8000/api/uploads/flow-logs/ \
   -F "source=prod-vpc" \
   -F "auto_correlate=true" \
+  -F "log_format=version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status" \
   -F "file=@sample-flow.log"
 ```
 

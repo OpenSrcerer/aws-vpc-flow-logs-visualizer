@@ -1,7 +1,11 @@
 import gzip
+import io
+from contextlib import ExitStack
+from itertools import islice
 
 from django.db import IntegrityError, transaction
-from django.db.models import Count, F, Max, Min, Q
+from django.db import connection
+from django.db.models import BigIntegerField, Count, F, Max, Min, Q, Sum
 from django.utils.dateparse import parse_datetime
 from rest_framework import status, viewsets
 from rest_framework.exceptions import ValidationError
@@ -10,13 +14,15 @@ from rest_framework.views import APIView
 
 from .advanced_filters import (
     AdvancedFilterError,
+    advanced_filter_can_run_in_db,
+    build_prefilter_q_from_advanced_filter_ast,
     evaluate_advanced_filter,
     inject_instance_context,
     parse_advanced_filter,
     validate_advanced_filter_ast,
 )
 from .models import CorrelatedFlow, FlowLogEntry, IpMetadata, NetworkGroup
-from .parsers import parse_vpc_flow_log_lines
+from .parsers import parse_vpc_flow_log_line
 from .serializers import (
     CorrelatedFlowSerializer,
     FlowLogEntrySerializer,
@@ -34,6 +40,34 @@ from .services import (
     upsert_correlated_flows,
 )
 
+ADVANCED_FILTER_CHUNK_SIZE = 2000
+ADVANCED_FILTER_SCAN_LIMIT = 100_000
+FLOW_LOG_PARSE_BATCH_SIZE = 5000
+FLOW_LOG_PARSE_ERROR_SAMPLE_LIMIT = 100
+SQLITE_VARIABLE_LIMIT = 900
+
+
+def _chunks(iterable, size):
+    iterator = iter(iterable)
+    while True:
+        chunk = list(islice(iterator, size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def _safe_int(value, *, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
 
 class HealthView(APIView):
     def get(self, request):
@@ -44,6 +78,43 @@ class HealthView(APIView):
                 "correlated_flows": CorrelatedFlow.objects.count(),
                 "ip_metadata": IpMetadata.objects.count(),
                 "network_groups": NetworkGroup.objects.count(),
+            }
+        )
+
+
+class DashboardSummaryView(APIView):
+    def get(self, request):
+        total_bytes_expr = F("c2s_bytes") + F("s2c_bytes")
+        total_packets_expr = F("c2s_packets") + F("s2c_packets")
+
+        totals = CorrelatedFlow.objects.aggregate(
+            total_bytes=Sum(total_bytes_expr, output_field=BigIntegerField()),
+            total_packets=Sum(total_packets_expr, output_field=BigIntegerField()),
+            total_sessions=Sum("flow_count", output_field=BigIntegerField()),
+        )
+
+        protocol_rows = (
+            CorrelatedFlow.objects.values("protocol")
+            .annotate(total_bytes=Sum(total_bytes_expr, output_field=BigIntegerField()))
+            .order_by("-total_bytes", "protocol")[:6]
+        )
+
+        protocol_breakdown = [
+            {
+                "protocol": row["protocol"],
+                "bytes": int(row["total_bytes"] or 0),
+            }
+            for row in protocol_rows
+        ]
+
+        return Response(
+            {
+                "traffic": {
+                    "total_bytes": int(totals.get("total_bytes") or 0),
+                    "total_packets": int(totals.get("total_packets") or 0),
+                    "total_sessions": int(totals.get("total_sessions") or 0),
+                },
+                "protocol_breakdown": protocol_breakdown,
             }
         )
 
@@ -76,7 +147,15 @@ class GlobalSearchView(APIView):
         except ValueError:
             limit = 25
 
-        protocol_alias_map = {"icmp": 1, "tcp": 6, "udp": 17}
+        protocol_alias_map = {
+            "icmp": 1,
+            "ipip": 4,
+            "ip-in-ip": 4,
+            "ip_in_ip": 4,
+            "ipinip": 4,
+            "tcp": 6,
+            "udp": 17,
+        }
         protocol_number = protocol_alias_map.get(query.lower())
         integer_query = None
         try:
@@ -173,6 +252,7 @@ class FlowLogEntryViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = FlowLogEntry.objects.order_by("-start_time", "-id")
 
     def get_queryset(self):
+        self._manual_filtered_ids = None
         queryset = super().get_queryset()
 
         srcaddr = self.request.query_params.get("srcaddr")
@@ -212,32 +292,11 @@ class FlowLogEntryViewSet(viewsets.ReadOnlyModelViewSet):
             except AdvancedFilterError as exc:
                 raise ValidationError({"advanced_filter": str(exc)}) from exc
 
-            ip_addresses: set[str] = set()
-            for src_ip, dst_ip in queryset.values_list("srcaddr", "dstaddr").iterator(chunk_size=2000):
-                if src_ip:
-                    ip_addresses.add(str(src_ip))
-                if dst_ip:
-                    ip_addresses.add(str(dst_ip))
-
-            metadata_by_ip: dict[str, dict] = {}
-            if ip_addresses:
-                metadata_fields = (
-                    "ip_address",
-                    "name",
-                    "account_owner",
-                    "region",
-                    "availability_zone",
-                    "instance_id",
-                    "interface_id",
-                    "instance_type",
-                    "state",
-                    "provider",
-                    "asset_kind",
-                    "tags",
-                )
-                metadata_rows = IpMetadata.objects.filter(ip_address__in=ip_addresses).values(*metadata_fields)
-                for metadata_row in metadata_rows.iterator(chunk_size=2000):
-                    metadata_by_ip[str(metadata_row["ip_address"])] = metadata_row
+            prefilter_q = build_prefilter_q_from_advanced_filter_ast(ast)
+            if prefilter_q is not None:
+                queryset = queryset.filter(prefilter_q)
+                if advanced_filter_can_run_in_db(ast):
+                    return queryset
 
             candidate_rows = queryset.values(
                 "id",
@@ -251,25 +310,104 @@ class FlowLogEntryViewSet(viewsets.ReadOnlyModelViewSet):
                 "interface_id",
                 "log_status",
             )
+            scan_limit_param = self.request.query_params.get("scan_limit")
+            if scan_limit_param:
+                scan_limit = _safe_int(
+                    scan_limit_param,
+                    default=ADVANCED_FILTER_SCAN_LIMIT,
+                    minimum=1,
+                    maximum=1_000_000,
+                )
+                candidate_rows = candidate_rows[:scan_limit]
 
             matching_ids = []
-            for row in candidate_rows.iterator(chunk_size=2000):
-                inject_instance_context(
-                    row,
-                    src_meta=metadata_by_ip.get(str(row.get("srcaddr"))),
-                    dst_meta=metadata_by_ip.get(str(row.get("dstaddr"))),
-                )
-                try:
-                    if evaluate_advanced_filter(ast, row):
-                        matching_ids.append(row["id"])
-                except AdvancedFilterError as exc:
-                    raise ValidationError({"advanced_filter": str(exc)}) from exc
+            metadata_fields = (
+                "ip_address",
+                "name",
+                "account_owner",
+                "region",
+                "availability_zone",
+                "instance_id",
+                "interface_id",
+                "instance_type",
+                "state",
+                "provider",
+                "asset_kind",
+                "tags",
+            )
+
+            row_iterator = candidate_rows.iterator(chunk_size=ADVANCED_FILTER_CHUNK_SIZE)
+            for row_chunk in _chunks(row_iterator, ADVANCED_FILTER_CHUNK_SIZE):
+                chunk_ips: set[str] = set()
+                for row in row_chunk:
+                    src_ip = row.get("srcaddr")
+                    dst_ip = row.get("dstaddr")
+                    if src_ip:
+                        chunk_ips.add(str(src_ip))
+                    if dst_ip:
+                        chunk_ips.add(str(dst_ip))
+
+                metadata_by_ip: dict[str, dict] = {}
+                if chunk_ips:
+                    metadata_rows = IpMetadata.objects.filter(ip_address__in=chunk_ips).values(*metadata_fields)
+                    for metadata_row in metadata_rows.iterator(chunk_size=ADVANCED_FILTER_CHUNK_SIZE):
+                        metadata_by_ip[str(metadata_row["ip_address"])] = metadata_row
+
+                for row in row_chunk:
+                    inject_instance_context(
+                        row,
+                        src_meta=metadata_by_ip.get(str(row.get("srcaddr"))),
+                        dst_meta=metadata_by_ip.get(str(row.get("dstaddr"))),
+                    )
+                    try:
+                        if evaluate_advanced_filter(ast, row):
+                            matching_ids.append(row["id"])
+                    except AdvancedFilterError as exc:
+                        raise ValidationError({"advanced_filter": str(exc)}) from exc
 
             if not matching_ids:
                 return queryset.none()
+            self._manual_filtered_ids = matching_ids
+            if connection.vendor == "sqlite" and len(matching_ids) > SQLITE_VARIABLE_LIMIT:
+                return queryset
             queryset = queryset.filter(id__in=matching_ids)
 
         return queryset
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        manual_filtered_ids = getattr(self, "_manual_filtered_ids", None)
+
+        if (
+            manual_filtered_ids is not None
+            and connection.vendor == "sqlite"
+            and len(manual_filtered_ids) > SQLITE_VARIABLE_LIMIT
+        ):
+            page_ids = self.paginate_queryset(manual_filtered_ids)
+            if page_ids is not None:
+                rows_by_id = {
+                    row.id: row
+                    for row in FlowLogEntry.objects.filter(id__in=page_ids)
+                }
+                ordered_rows = [rows_by_id[row_id] for row_id in page_ids if row_id in rows_by_id]
+                serializer = self.get_serializer(ordered_rows, many=True)
+                return self.get_paginated_response(serializer.data)
+
+            rows_by_id = {
+                row.id: row
+                for row in FlowLogEntry.objects.filter(id__in=manual_filtered_ids)
+            }
+            ordered_rows = [rows_by_id[row_id] for row_id in manual_filtered_ids if row_id in rows_by_id]
+            serializer = self.get_serializer(ordered_rows, many=True)
+            return Response(serializer.data)
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
 
 
 class AdvancedFlowFilterValidateView(APIView):
@@ -339,22 +477,117 @@ class NetworkGroupViewSet(viewsets.ModelViewSet):
     queryset = NetworkGroup.objects.order_by("name")
 
 
-def _decode_uploaded_flow_file(uploaded_file) -> str:
+def _iter_uploaded_flow_lines(uploaded_file):
     file_name = (getattr(uploaded_file, "name", "") or "").lower()
-    payload = uploaded_file.read()
+    uploaded_file.open(mode="rb")
+    uploaded_file.seek(0)
+    magic = uploaded_file.read(2)
+    uploaded_file.seek(0)
 
-    # Accept gzip uploads (.log.gz/.gz) and auto-detect via magic bytes.
-    is_gzip = file_name.endswith(".gz") or payload.startswith(b"\x1f\x8b")
-    if is_gzip:
+    is_gzip = file_name.endswith(".gz") or magic == b"\x1f\x8b"
+    source_stream = uploaded_file.file if hasattr(uploaded_file, "file") else uploaded_file
+
+    with ExitStack() as stack:
+        binary_stream = source_stream
+        if is_gzip:
+            try:
+                binary_stream = stack.enter_context(gzip.GzipFile(fileobj=source_stream, mode="rb"))
+            except (OSError, EOFError) as exc:
+                raise ValueError("Uploaded gzip file could not be decompressed.") from exc
+
+        text_stream = stack.enter_context(io.TextIOWrapper(binary_stream, encoding="utf-8"))
         try:
-            payload = gzip.decompress(payload)
+            for line in text_stream:
+                yield line
+        except UnicodeDecodeError as exc:
+            raise ValueError("Uploaded flow log file is not valid UTF-8 text.") from exc
         except (OSError, EOFError) as exc:
-            raise ValueError("Uploaded gzip file could not be decompressed.") from exc
+            if is_gzip:
+                raise ValueError("Uploaded gzip file could not be decompressed.") from exc
+            raise
 
-    try:
-        return payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Uploaded flow log file is not valid UTF-8 text.") from exc
+
+def _flush_flow_record_batch(
+    records: list,
+    *,
+    source: str,
+    auto_correlate: bool,
+) -> tuple[int, dict[str, int]]:
+    if not records:
+        return 0, {"created": 0, "updated": 0}
+
+    entries = parsed_records_to_entries(records, source=source)
+    FlowLogEntry.objects.bulk_create(entries, batch_size=FLOW_LOG_PARSE_BATCH_SIZE)
+
+    correlation = {"created": 0, "updated": 0}
+    if auto_correlate:
+        correlation = upsert_correlated_flows(entries)
+
+    ingested = len(entries)
+    records.clear()
+    return ingested, correlation
+
+
+def _ingest_flow_line_iter(
+    lines,
+    *,
+    source: str,
+    auto_correlate: bool,
+    log_format: tuple[str, ...] | None = None,
+    error_prefix: str = "",
+) -> dict:
+    parse_errors: list[str | dict] = []
+    parse_error_count = 0
+    ingested = 0
+    correlation = {"created": 0, "updated": 0}
+    record_batch = []
+
+    for line_number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        try:
+            record_batch.append(parse_vpc_flow_log_line(stripped, log_format=log_format))
+        except (ValueError, TypeError) as exc:
+            parse_error_count += 1
+            if len(parse_errors) < FLOW_LOG_PARSE_ERROR_SAMPLE_LIMIT:
+                error_item: str | dict = {
+                    "line": line_number,
+                    "error": str(exc),
+                    "raw": stripped,
+                }
+                if error_prefix:
+                    error_item = f"{error_prefix}: {error_item}"
+                parse_errors.append(error_item)
+            continue
+
+        if len(record_batch) >= FLOW_LOG_PARSE_BATCH_SIZE:
+            batch_ingested, batch_correlation = _flush_flow_record_batch(
+                record_batch,
+                source=source,
+                auto_correlate=auto_correlate,
+            )
+            ingested += batch_ingested
+            correlation["created"] += batch_correlation.get("created", 0)
+            correlation["updated"] += batch_correlation.get("updated", 0)
+
+    if record_batch:
+        batch_ingested, batch_correlation = _flush_flow_record_batch(
+            record_batch,
+            source=source,
+            auto_correlate=auto_correlate,
+        )
+        ingested += batch_ingested
+        correlation["created"] += batch_correlation.get("created", 0)
+        correlation["updated"] += batch_correlation.get("updated", 0)
+
+    return {
+        "ingested": ingested,
+        "parse_error_count": parse_error_count,
+        "parse_errors": parse_errors,
+        "correlation": correlation,
+    }
 
 
 class FlowLogUploadView(APIView):
@@ -364,6 +597,7 @@ class FlowLogUploadView(APIView):
 
         source = serializer.validated_data.get("source", "")
         auto_correlate = serializer.validated_data.get("auto_correlate", True)
+        log_format = serializer.validated_data.get("log_format")
         single_file = serializer.validated_data.get("file")
         declared_files = serializer.validated_data.get("files") or []
         uploaded_files = []
@@ -380,65 +614,60 @@ class FlowLogUploadView(APIView):
             seen_ids.add(marker)
             uploaded_files.append(uploaded)
 
-        parse_errors: list[str] = []
+        parse_errors: list[str | dict] = []
+        parse_error_count = 0
         ingested_total = 0
         correlation_stats = {"created": 0, "updated": 0}
         file_results: list[dict] = []
 
+        def _consume_ingest_result(result: dict) -> None:
+            nonlocal parse_error_count, ingested_total
+            ingested_total += result.get("ingested", 0)
+            parse_error_count += result.get("parse_error_count", 0)
+            correlation_stats["created"] += result.get("correlation", {}).get("created", 0)
+            correlation_stats["updated"] += result.get("correlation", {}).get("updated", 0)
+            remaining = FLOW_LOG_PARSE_ERROR_SAMPLE_LIMIT - len(parse_errors)
+            if remaining > 0:
+                parse_errors.extend(result.get("parse_errors", [])[:remaining])
+
         for uploaded in uploaded_files:
             try:
-                raw = _decode_uploaded_flow_file(uploaded)
-            except ValueError as exc:
-                parse_errors.append(f"{uploaded.name}: {exc}")
-                file_results.append(
-                    {
-                        "name": uploaded.name,
-                        "ingested": 0,
-                        "parse_error_count": 1,
-                    }
+                result = _ingest_flow_line_iter(
+                    _iter_uploaded_flow_lines(uploaded),
+                    source=source,
+                    auto_correlate=auto_correlate,
+                    log_format=log_format,
+                    error_prefix=uploaded.name,
                 )
-                continue
-
-            records, errors = parse_vpc_flow_log_lines(raw.splitlines())
-            entries = parsed_records_to_entries(records, source=source)
-
-            if entries:
-                FlowLogEntry.objects.bulk_create(entries, batch_size=1000)
-                ingested_total += len(entries)
-
-                if auto_correlate:
-                    stats = upsert_correlated_flows(entries)
-                    correlation_stats["created"] += stats.get("created", 0)
-                    correlation_stats["updated"] += stats.get("updated", 0)
-
-            parse_errors.extend([f"{uploaded.name}: {item}" for item in errors])
-            file_results.append(
-                {
-                    "name": uploaded.name,
-                    "ingested": len(entries),
-                    "parse_error_count": len(errors),
+            except ValueError as exc:
+                result = {
+                    "ingested": 0,
+                    "parse_error_count": 1,
+                    "parse_errors": [f"{uploaded.name}: {exc}"],
+                    "correlation": {"created": 0, "updated": 0},
                 }
-            )
+
+            _consume_ingest_result(result)
+            file_results.append({
+                "name": uploaded.name,
+                "ingested": result.get("ingested", 0),
+                "parse_error_count": result.get("parse_error_count", 0),
+            })
 
         lines_payload = serializer.validated_data.get("lines", "")
         if lines_payload:
-            records, errors = parse_vpc_flow_log_lines(lines_payload.splitlines())
-            entries = parsed_records_to_entries(records, source=source)
-
-            if entries:
-                FlowLogEntry.objects.bulk_create(entries, batch_size=1000)
-                ingested_total += len(entries)
-                if auto_correlate:
-                    stats = upsert_correlated_flows(entries)
-                    correlation_stats["created"] += stats.get("created", 0)
-                    correlation_stats["updated"] += stats.get("updated", 0)
-
-            parse_errors.extend(errors)
+            result = _ingest_flow_line_iter(
+                io.StringIO(lines_payload),
+                source=source,
+                auto_correlate=auto_correlate,
+                log_format=log_format,
+            )
+            _consume_ingest_result(result)
             file_results.append(
                 {
                     "name": "(pasted-lines)",
-                    "ingested": len(entries),
-                    "parse_error_count": len(errors),
+                    "ingested": result.get("ingested", 0),
+                    "parse_error_count": result.get("parse_error_count", 0),
                 }
             )
 
@@ -447,8 +676,8 @@ class FlowLogUploadView(APIView):
                 "ingested": ingested_total,
                 "ingested_files": len(file_results),
                 "file_results": file_results,
-                "parse_errors": parse_errors[:100],
-                "parse_error_count": len(parse_errors),
+                "parse_errors": parse_errors,
+                "parse_error_count": parse_error_count,
                 "correlation": correlation_stats,
             },
             status=status.HTTP_201_CREATED,
@@ -733,36 +962,67 @@ class NetworkGroupPurgeView(APIView):
 
 class MeshGraphView(APIView):
     def get(self, request):
-        queryset = CorrelatedFlow.objects.order_by("-last_seen")
+        queryset = CorrelatedFlow.objects.order_by("-last_seen").only(
+            "client_ip",
+            "server_ip",
+            "protocol",
+            "server_port",
+            "flow_count",
+            "c2s_packets",
+            "c2s_bytes",
+            "s2c_packets",
+            "s2c_bytes",
+            "last_seen",
+        )
 
         edge_limit = None
         limit = request.query_params.get("limit")
         if limit:
-            try:
-                parsed_limit = int(limit)
-                if parsed_limit > 0:
-                    edge_limit = parsed_limit
-            except ValueError:
-                pass
+            parsed_limit = _safe_int(limit, default=300, minimum=1, maximum=5000)
+            if parsed_limit > 0:
+                edge_limit = parsed_limit
 
-        payload = build_mesh_payload(queryset)
+        payload = build_mesh_payload(queryset, edge_limit=edge_limit)
         if edge_limit is not None:
-            limited_edges = payload["edges"][:edge_limit]
             connected_node_ids = {
                 edge["source"]
-                for edge in limited_edges
+                for edge in payload["edges"]
                 if edge.get("source")
             } | {
                 edge["target"]
-                for edge in limited_edges
+                for edge in payload["edges"]
                 if edge.get("target")
             }
-            payload["edges"] = limited_edges
-            payload["nodes"] = [
+            all_nodes = payload["nodes"]
+            connected_nodes = [
                 node
-                for node in payload["nodes"]
+                for node in all_nodes
                 if node.get("id") in connected_node_ids
             ]
+            connected_ids = {node.get("id") for node in connected_nodes if node.get("id")}
+
+            # Preserve at least one representative node per group even when
+            # its traffic edges are outside the current edge limit.
+            best_group_node: dict[str, dict] = {}
+            for node in all_nodes:
+                group_name = str(node.get("group") or "").strip()
+                node_id = node.get("id")
+                if not group_name or not node_id or node_id in connected_ids:
+                    continue
+                current = best_group_node.get(group_name)
+                node_traffic = (node.get("bytes_in", 0) or 0) + (node.get("bytes_out", 0) or 0)
+                if current is None:
+                    best_group_node[group_name] = node
+                    continue
+                current_traffic = (current.get("bytes_in", 0) or 0) + (current.get("bytes_out", 0) or 0)
+                if node_traffic > current_traffic:
+                    best_group_node[group_name] = node
+
+            payload["nodes"] = [*connected_nodes, *best_group_node.values()]
+            payload["nodes"].sort(
+                key=lambda item: item.get("bytes_in", 0) + item.get("bytes_out", 0),
+                reverse=True,
+            )
 
         return Response(payload)
 
@@ -776,7 +1036,19 @@ class FirewallRecommendationView(APIView):
             threshold = 0
 
         recommendations = build_firewall_recommendations(
-            CorrelatedFlow.objects.order_by("-last_seen"),
+            CorrelatedFlow.objects.order_by("-last_seen").only(
+                "client_ip",
+                "server_ip",
+                "protocol",
+                "server_port",
+                "flow_count",
+                "c2s_packets",
+                "c2s_bytes",
+                "s2c_packets",
+                "s2c_bytes",
+                "first_seen",
+                "last_seen",
+            ),
             min_bytes=threshold,
         )
 

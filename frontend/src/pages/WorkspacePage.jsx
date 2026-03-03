@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, extractResults } from "../lib/api";
 import { formatBytes, formatInt } from "../lib/graph";
 import Icon from "../components/Icon";
@@ -10,9 +10,9 @@ export default function WorkspacePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const [health, setHealth] = useState(null);
   const [mesh, setMesh] = useState({ nodes: [], edges: [] });
   const [correlatedFlows, setCorrelatedFlows] = useState([]);
+  const [correlatedFlowCount, setCorrelatedFlowCount] = useState(0);
 
   const [flowLogs, setFlowLogs] = useState([]);
   const [flowLogCount, setFlowLogCount] = useState(0);
@@ -21,6 +21,7 @@ export default function WorkspacePage() {
 
   const [showLogs, setShowLogs] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
+  const didInitFetchRef = useRef(false);
 
   const PAGE_SIZE = 50;
 
@@ -28,14 +29,14 @@ export default function WorkspacePage() {
     setLoading(true);
     setError("");
     try {
-      const [healthRes, meshRes, correlatedRes] = await Promise.all([
-        api.getHealth(),
+      const [meshRes, correlatedRes] = await Promise.all([
         api.getMesh(),
         api.listCorrelatedFlows(),
       ]);
-      setHealth(healthRes);
       setMesh(meshRes);
-      setCorrelatedFlows(extractResults(correlatedRes));
+      const correlated = extractResults(correlatedRes);
+      setCorrelatedFlows(correlated);
+      setCorrelatedFlowCount(Number(correlatedRes?.count ?? correlated.length));
     } catch (err) {
       setError(err.message || "Failed to load dashboard data");
     } finally {
@@ -62,9 +63,13 @@ export default function WorkspacePage() {
   );
 
   useEffect(() => {
+    if (didInitFetchRef.current) {
+      return;
+    }
+    didInitFetchRef.current = true;
     fetchDashboard();
     fetchFlowLogs(1, {});
-  }, []);
+  }, [fetchDashboard, fetchFlowLogs]);
 
   function handleApplyFilters(newFilters) {
     setFilters(newFilters);
@@ -107,7 +112,7 @@ export default function WorkspacePage() {
 
           <div className="flex items-center gap-1.5 text-xs text-slate-500">
             <Icon name="stacks" size={14} className="text-primary" />
-            <span className="font-medium text-slate-700">{formatInt(health?.flow_log_entries ?? 0)}</span>
+            <span className="font-medium text-slate-700">{formatInt(flowLogCount)}</span>
             <span>flows</span>
           </div>
           <div className="flex items-center gap-1.5 text-xs text-slate-500">
@@ -116,7 +121,7 @@ export default function WorkspacePage() {
           </div>
           <div className="flex items-center gap-1.5 text-xs text-slate-500">
             <Icon name="link" size={14} className="text-primary" />
-            <span className="font-medium text-slate-700">{formatInt(health?.correlated_flows ?? 0)}</span>
+            <span className="font-medium text-slate-700">{formatInt(correlatedFlowCount)}</span>
             <span>sessions</span>
           </div>
 
@@ -141,7 +146,7 @@ export default function WorkspacePage() {
         </div>
 
         <div className={`flex-1 min-h-0 ${showLogs ? "h-[55%]" : ""}`}>
-          <TopologyPanel mesh={mesh} />
+          <TopologyPanel mesh={mesh} loading={loading} />
         </div>
 
         {showLogs && (

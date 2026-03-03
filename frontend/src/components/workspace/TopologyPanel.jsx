@@ -324,7 +324,7 @@ function Row({ label, value, mono }) {
 /*  Main panel — full-bleed Cytoscape canvas with overlays            */
 /* ------------------------------------------------------------------ */
 
-export default function TopologyPanel({ mesh }) {
+export default function TopologyPanel({ mesh, loading = false }) {
   const [layoutName, setLayoutName] = useState("fcose");
   const [hideLowTraffic, setHideLowTraffic] = useState(true);
   const [selected, setSelected] = useState(null);
@@ -425,8 +425,31 @@ export default function TopologyPanel({ mesh }) {
         <div className="absolute inset-0 flex items-center justify-center z-10">
           <div className="text-center">
             <Icon name="hub" size={48} className="text-slate-300 mx-auto mb-3" />
-            <p className="text-sm text-slate-500">No topology data available.</p>
-            <p className="text-xs text-slate-400 mt-1">Upload flow logs to generate the service map.</p>
+            {loading ? (
+              <>
+                <p className="text-sm text-slate-500">Loading topology data...</p>
+                <p className="text-xs text-slate-400 mt-1">Fetching mesh nodes and edges.</p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-slate-500">No topology data available.</p>
+                <p className="text-xs text-slate-400 mt-1">Upload flow logs to generate the service map.</p>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {loading && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-white/55 backdrop-blur-[1px]">
+          <div className="w-[16rem] max-w-[85%] rounded-xl border border-neutral-200 bg-white/95 shadow-lg px-4 py-3">
+            <div className="flex items-center gap-2">
+              <Icon name="progress_activity" size={18} className="text-primary animate-spin" />
+              <span className="text-sm font-medium text-slate-700">Populating mesh view...</span>
+            </div>
+            <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-neutral-100">
+              <div className="h-full w-1/2 rounded-full bg-primary animate-pulse" />
+            </div>
           </div>
         </div>
       )}

@@ -34,10 +34,14 @@ const INSTANCE_ASSET_FIELD_PAIRS = [
   ["instance.asset_kind", "asset.asset_kind"],
 ];
 
+const DEFAULT_VPC_LOG_FORMAT =
+  "version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status";
+
 export default function LogsPage() {
   const PAGE_SIZE = 50;
 
   const [source, setSource] = useState("manual-upload");
+  const [logFormat, setLogFormat] = useState(DEFAULT_VPC_LOG_FORMAT);
   const [lines, setLines] = useState("");
   const [files, setFiles] = useState([]);
   const [autoCorrelate, setAutoCorrelate] = useState(true);
@@ -145,6 +149,7 @@ export default function LogsPage() {
       const payload = new FormData();
       payload.append("source", source);
       payload.append("auto_correlate", String(autoCorrelate));
+      payload.append("log_format", logFormat.trim());
 
       if (hasFiles) {
         for (const file of files) {
@@ -300,7 +305,7 @@ export default function LogsPage() {
               <span className="text-[11px] text-slate-400">
                 Raw flow fields: addr.src, addr.dst, port.src, port.dst, protocol, action, source, interface_id,
                 log_status. Instance/asset fields: instance.name, instance.owner, instance.region, instance.az,
-                instance.tags.KEY (also `asset.*`). Protocol accepts names (`icmp`, `tcp`, `udp`) or numbers.
+                instance.tags.KEY (also `asset.*`). Protocol accepts names (`icmp`, `ipip`, `tcp`, `udp`) or numbers.
                 Wildcards are supported for string values (for example `instance.name=*aws*`). Operators: =, ==, !=,
                 and, or, parentheses. See Help for complete syntax and examples.
               </span>
@@ -377,6 +382,20 @@ export default function LogsPage() {
                   {files.length === 0
                     ? "No files selected."
                     : `${files.length} file${files.length > 1 ? "s" : ""} selected`}
+                </span>
+              </label>
+
+              <label className="flex flex-col gap-1.5">
+                <span className="text-xs text-slate-500 font-medium">Flow Log Format</span>
+                <input
+                  value={logFormat}
+                  onChange={(e) => setLogFormat(e.target.value)}
+                  placeholder={DEFAULT_VPC_LOG_FORMAT}
+                  className={`${inputClass} font-mono`}
+                />
+                <span className="text-[11px] text-slate-400">
+                  Defaults to the standard AWS VPC format. Supports plain fields or token format like{" "}
+                  <code>{"${srcaddr}"}</code>.
                 </span>
               </label>
 
@@ -493,7 +512,7 @@ export default function LogsPage() {
                     <code>addr.src == 10.0.0.0/16</code>.
                   </li>
                   <li>
-                    <code>protocol</code> accepts names (<code>icmp</code>, <code>tcp</code>, <code>udp</code>) or
+                    <code>protocol</code> accepts names (<code>icmp</code>, <code>ipip</code>, <code>tcp</code>, <code>udp</code>) or
                     numbers.
                   </li>
                   <li>String comparisons are case-insensitive.</li>
@@ -540,7 +559,8 @@ instance.owner == 4442424324
 instance.name = *aws*
 instance.region = us-east-1 and instance.az = us-east-1d
 instance.tags.environment = "prod"
-asset.tags.team != "security" and action == ACCEPT`}
+asset.tags.team != "security" and action == ACCEPT
+protocol == ipip`}
                   </pre>
                 </div>
               </section>

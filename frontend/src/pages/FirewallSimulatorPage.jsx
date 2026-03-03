@@ -10,6 +10,7 @@ const PAGE_SIZE = 1000;
 
 const PROTOCOL_NAMES = {
   1: "ICMP",
+  4: "IPIP",
   6: "TCP",
   17: "UDP",
 };
@@ -19,6 +20,7 @@ const RULE_PROTOCOL_OPTIONS = [
   { value: "6", label: "TCP (6)" },
   { value: "17", label: "UDP (17)" },
   { value: "1", label: "ICMP (1, port 0)" },
+  { value: "4", label: "IP-in-IP (4)" },
 ];
 
 const EMPTY_RULE_FORM = {
@@ -184,7 +186,8 @@ function matchesNetworks(ipInput, networks) {
   }
 }
 
-async function listAllPages(listFn) {
+async function listAllPages(listFn, options = {}) {
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
   let page = 1;
   const items = [];
 
@@ -192,12 +195,22 @@ async function listAllPages(listFn) {
     const response = await listFn({ page, page_size: PAGE_SIZE });
     const chunk = extractResults(response);
     items.push(...chunk);
+    const totalCount = Number(response?.count || 0);
+    if (onProgress) {
+      const percent = totalCount > 0
+        ? Math.min(100, Math.round((items.length / totalCount) * 100))
+        : 0;
+      onProgress({
+        loaded: items.length,
+        total: totalCount,
+        percent,
+      });
+    }
 
     if (!Array.isArray(response?.results)) {
       break;
     }
 
-    const totalCount = Number(response?.count || 0);
     if (totalCount > 0 && items.length >= totalCount) {
       break;
     }
@@ -443,6 +456,11 @@ export default function FirewallSimulatorPage() {
   const [busyKey, setBusyKey] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [flowFetchProgress, setFlowFetchProgress] = useState({
+    loaded: 0,
+    total: 0,
+    percent: 0,
+  });
 
   const [correlatedFlows, setCorrelatedFlows] = useState([]);
   const [metadata, setMetadata] = useState([]);
@@ -495,10 +513,18 @@ export default function FirewallSimulatorPage() {
   const refreshData = useCallback(async () => {
     setLoading(true);
     setError("");
+    setFlowFetchProgress({ loaded: 0, total: 0, percent: 0 });
 
     try {
       const [flows, assets, networkGroups] = await Promise.all([
-        listAllPages((params) => api.listCorrelatedFlows(params)),
+        listAllPages(
+          (params) => api.listCorrelatedFlows(params),
+          {
+            onProgress: (progress) => {
+              setFlowFetchProgress(progress);
+            },
+          },
+        ),
         listAllPages((params) => api.listIpMetadata(params)),
         listAllPages((params) => api.listNetworkGroups(params)),
       ]);
@@ -521,6 +547,11 @@ export default function FirewallSimulatorPage() {
       setCorrelatedFlows(
         enrichedFlows.sort((a, b) => b._lastSeenMs - a._lastSeenMs)
       );
+      setFlowFetchProgress({
+        loaded: flows.length,
+        total: flows.length,
+        percent: 100,
+      });
       setMetadata(assets);
       setGroups(networkGroups);
     } catch (err) {
@@ -1320,8 +1351,33 @@ export default function FirewallSimulatorPage() {
                   )}
                   {loading && (
                     <tr>
-                      <td colSpan={8} className="px-3 py-8 text-center text-slate-400">
-                        Loading simulator data...
+                      <td colSpan={8} className="px-3 py-8 text-center">
+                        <div className="mx-auto w-full max-w-md flex flex-col gap-2">
+                          <div className="flex items-center justify-center gap-1.5 text-slate-500">
+                            <Icon name="progress_activity" size={14} className="animate-spin text-primary" />
+                            <span>Loading correlated flows...</span>
+                            {flowFetchProgress.total > 0 && (
+                              <span className="font-medium text-slate-700">{flowFetchProgress.percent}%</span>
+                            )}
+                          </div>
+                          <div className="h-2 w-full rounded-full overflow-hidden bg-neutral-100">
+                            <div
+                              className={`h-full rounded-full bg-primary transition-all duration-300 ${
+                                flowFetchProgress.total > 0 ? "" : "animate-pulse w-1/3"
+                              }`}
+                              style={
+                                flowFetchProgress.total > 0
+                                  ? { width: `${flowFetchProgress.percent}%` }
+                                  : undefined
+                              }
+                            />
+                          </div>
+                          <p className="text-[11px] text-slate-400">
+                            {flowFetchProgress.total > 0
+                              ? `${formatInt(flowFetchProgress.loaded)} of ${formatInt(flowFetchProgress.total)} flows fetched`
+                              : "Preparing first results page..."}
+                          </p>
+                        </div>
                       </td>
                     </tr>
                   )}

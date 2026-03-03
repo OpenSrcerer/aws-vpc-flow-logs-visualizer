@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import AppLayout from "./layouts/AppLayout";
 import { clearAuthSession, getAuthHeaders } from "./lib/auth";
@@ -24,8 +24,15 @@ function PageLoader() {
 function AuthGate({ children }) {
   const location = useLocation();
   const [status, setStatus] = useState("checking");
+  const validatedPathRef = useRef("");
 
   useEffect(() => {
+    const pathKey = `${location.pathname}${location.search}`;
+    if (validatedPathRef.current === pathKey && status !== "checking") {
+      return;
+    }
+    validatedPathRef.current = pathKey;
+
     let cancelled = false;
 
     async function validateAccess() {
@@ -58,7 +65,7 @@ function AuthGate({ children }) {
     return () => {
       cancelled = true;
     };
-  }, [location.pathname, location.search]);
+  }, [location.pathname, location.search, status]);
 
   if (status === "checking") {
     return <PageLoader />;

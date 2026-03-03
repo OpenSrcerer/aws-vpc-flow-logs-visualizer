@@ -3,6 +3,7 @@ import ipaddress
 from rest_framework import serializers
 
 from .models import CorrelatedFlow, FlowLogEntry, IpMetadata, NetworkGroup
+from .parsers import parse_vpc_flow_log_format
 
 
 class FlowLogEntrySerializer(serializers.ModelSerializer):
@@ -161,6 +162,13 @@ class FlowLogUploadSerializer(serializers.Serializer):
     lines = serializers.CharField(required=False, allow_blank=True)
     source = serializers.CharField(required=False, allow_blank=True, max_length=128)
     auto_correlate = serializers.BooleanField(required=False, default=True)
+    log_format = serializers.CharField(required=False, allow_blank=True, max_length=2048)
+
+    def validate_log_format(self, value):
+        try:
+            return parse_vpc_flow_log_format(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
 
     def validate(self, attrs):
         has_file = bool(attrs.get("file"))

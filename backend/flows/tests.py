@@ -6,7 +6,7 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.utils import timezone as django_timezone
 from rest_framework.test import APITestCase
-from flows.parsers import parse_vpc_flow_log_line, ParsedFlowRecord
+from flows.parsers import parse_vpc_flow_log_format, parse_vpc_flow_log_line, ParsedFlowRecord
 
 
 def _basic_auth(username: str, password: str) -> dict:
@@ -66,6 +66,28 @@ class ParseVPCFlowLogLineTests(TestCase):
         self.assertEqual(record.action, "ACCEPT")
         self.assertEqual(record.log_status, "OK")
         self.assertEqual(record.raw_line, line)
+
+    def test_parse_custom_format_with_field_reordering(self):
+        log_format = (
+            "${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} "
+            "${start} ${end} ${action} ${log-status} ${version} ${account-id} ${interface-id}"
+        )
+        line = "172.31.16.139 172.31.16.21 20641 22 6 20 4249 1418530010 1418530070 ACCEPT OK 2 123456789010 eni-1235"
+        record = parse_vpc_flow_log_line(line, log_format=log_format)
+        self.assertEqual(record.version, 2)
+        self.assertEqual(record.account_id, "123456789010")
+        self.assertEqual(record.interface_id, "eni-1235")
+        self.assertEqual(record.srcaddr, "172.31.16.139")
+        self.assertEqual(record.dstaddr, "172.31.16.21")
+        self.assertEqual(record.srcport, 20641)
+        self.assertEqual(record.dstport, 22)
+
+    def test_parse_vpc_flow_log_format_requires_supported_fields(self):
+        with self.assertRaisesMessage(
+            ValueError,
+            "log_format must include required fields",
+        ):
+            parse_vpc_flow_log_format("srcaddr dstaddr srcport dstport protocol packets bytes start end action")
 from django.test import TestCase
 from django.core.exceptions import ValidationError
 from flows.models import CorrelatedFlow, FlowLogEntry, IpMetadata, NetworkGroup
@@ -157,7 +179,7 @@ class NetworkGroupCleanTests(TestCase):
         group.clean()
         self.assertEqual(group.cidr, "2001:db8::/64")
         self.assertEqual(group.cidrs, ["2001:db8::/64"])
-from flows.parsers import parse_vpc_flow_log_lines, ParsedFlowRecord
+from flows.parsers import parse_vpc_flow_log_lines
 
 class ParseVPCFlowLogLinesTest(TestCase):
     def test_happy_path(self):
@@ -227,6 +249,49 @@ class ParseVPCFlowLogLinesTest(TestCase):
 
         self.assertEqual(errors[0]["line"], 4)
         self.assertIn("Expected at least 14 fields", errors[0]["error"])
+
+
+class FlowLogUploadApiTests(APITestCase):
+    def test_upload_accepts_custom_log_format(self):
+        response = self.client.post(
+            "/api/uploads/flow-logs/",
+            {
+                "source": "custom-format-test",
+                "lines": "172.31.16.139 172.31.16.21 20641 22 6 20 4249 1418530010 1418530070 ACCEPT OK 2 123456789010 eni-1235",
+                "log_format": (
+                    "srcaddr dstaddr srcport dstport protocol packets bytes start end action "
+                    "log-status version account-id interface-id"
+                ),
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["ingested"], 1)
+        self.assertEqual(response.data["parse_error_count"], 0)
+
+        entry = FlowLogEntry.objects.get()
+        self.assertEqual(entry.source, "custom-format-test")
+        self.assertEqual(entry.srcaddr, "172.31.16.139")
+        self.assertEqual(entry.dstaddr, "172.31.16.21")
+        self.assertEqual(entry.srcport, 20641)
+        self.assertEqual(entry.dstport, 22)
+        self.assertEqual(entry.protocol, 6)
+        self.assertEqual(entry.action, "ACCEPT")
+        self.assertEqual(entry.log_status, "OK")
+
+    def test_upload_rejects_invalid_log_format(self):
+        response = self.client.post(
+            "/api/uploads/flow-logs/",
+            {
+                "lines": "2 123456789010 eni-1235b8ca123456789 172.31.16.139 172.31.16.21 20641 22 6 20 4249 1418530010 1418530070 ACCEPT OK",
+                "log_format": "version account-id interface-id dstaddr srcport dstport protocol packets bytes start end action log-status",
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("required fields", str(response.data.get("log_format", "")))
 
 
 class MeshGroupingTests(APITestCase):
@@ -398,6 +463,205 @@ class GlobalSearchTests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertGreaterEqual(response.data["counts"]["correlated_flows"], 1)
+
+    def test_global_search_matches_ipip_protocol_alias(self):
+        now = django_timezone.now()
+        CorrelatedFlow.objects.create(
+            canonical_key="10.0.0.30:0>10.0.0.31:0/p4",
+            client_ip="10.0.0.30",
+            server_ip="10.0.0.31",
+            client_port=None,
+            server_port=None,
+            protocol=4,
+            flow_count=1,
+            c2s_packets=3,
+            c2s_bytes=1024,
+            s2c_packets=3,
+            s2c_bytes=1024,
+            first_seen=now,
+            last_seen=now,
+            action_counts={"ACCEPT": 1},
+        )
+
+        response = self.client.get("/api/search/?q=ipip")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(response.data["counts"]["correlated_flows"], 1)
+
+
+class FlowLogAdvancedFilterTests(APITestCase):
+    def test_not_equal_includes_null_ports(self):
+        now = django_timezone.now()
+
+        keep_null = FlowLogEntry.objects.create(
+            version=2,
+            account_id="123456789012",
+            interface_id="eni-null-port",
+            srcaddr="10.0.0.10",
+            dstaddr="10.0.0.11",
+            srcport=50000,
+            dstport=None,
+            protocol=6,
+            packets=5,
+            bytes=500,
+            start_time=now,
+            end_time=now,
+            action="ACCEPT",
+            log_status="OK",
+            source="filter-test",
+            raw_line="",
+        )
+        keep_other_port = FlowLogEntry.objects.create(
+            version=2,
+            account_id="123456789012",
+            interface_id="eni-other-port",
+            srcaddr="10.0.0.12",
+            dstaddr="10.0.0.13",
+            srcport=50001,
+            dstport=80,
+            protocol=6,
+            packets=6,
+            bytes=600,
+            start_time=now,
+            end_time=now,
+            action="ACCEPT",
+            log_status="OK",
+            source="filter-test",
+            raw_line="",
+        )
+        FlowLogEntry.objects.create(
+            version=2,
+            account_id="123456789012",
+            interface_id="eni-excluded-port",
+            srcaddr="10.0.0.14",
+            dstaddr="10.0.0.15",
+            srcport=50002,
+            dstport=443,
+            protocol=6,
+            packets=7,
+            bytes=700,
+            start_time=now,
+            end_time=now,
+            action="ACCEPT",
+            log_status="OK",
+            source="filter-test",
+            raw_line="",
+        )
+
+        response = self.client.get("/api/flow-logs/?advanced_filter=dstport!=443&page_size=100")
+
+        self.assertEqual(response.status_code, 200)
+        returned_ids = {item["id"] for item in response.data["results"]}
+        self.assertIn(keep_null.id, returned_ids)
+        self.assertIn(keep_other_port.id, returned_ids)
+
+    def test_cidr_filter_handles_large_result_set_in_sqlite(self):
+        now = django_timezone.now()
+        rows = []
+        for i in range(1105):
+            rows.append(
+                FlowLogEntry(
+                    version=2,
+                    account_id="123456789012",
+                    interface_id=f"eni-cidr-{i}",
+                    srcaddr=f"10.108.{i // 256}.{i % 256}",
+                    dstaddr="192.0.2.10",
+                    srcport=40000 + (i % 1000),
+                    dstport=443,
+                    protocol=6,
+                    packets=3,
+                    bytes=300,
+                    start_time=now,
+                    end_time=now,
+                    action="ACCEPT",
+                    log_status="OK",
+                    source="filter-test",
+                    raw_line="",
+                )
+            )
+        FlowLogEntry.objects.bulk_create(rows, batch_size=1000)
+
+        response = self.client.get(
+            "/api/flow-logs/?advanced_filter=addr.src==10.108.0.0/16&page_size=50&page=1"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1105)
+        self.assertEqual(len(response.data["results"]), 50)
+
+    def test_protocol_alias_ipip_matches_protocol_4(self):
+        now = django_timezone.now()
+        FlowLogEntry.objects.create(
+            version=2,
+            account_id="123456789012",
+            interface_id="eni-ipip",
+            srcaddr="10.200.0.10",
+            dstaddr="10.200.0.11",
+            srcport=None,
+            dstport=None,
+            protocol=4,
+            packets=9,
+            bytes=900,
+            start_time=now,
+            end_time=now,
+            action="ACCEPT",
+            log_status="OK",
+            source="filter-test",
+            raw_line="",
+        )
+
+        response = self.client.get("/api/flow-logs/?advanced_filter=protocol==ipip&page_size=50")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(response.data["count"], 1)
+
+
+class DashboardSummaryTests(APITestCase):
+    def test_dashboard_summary_aggregates_traffic_and_protocols(self):
+        now = django_timezone.now()
+
+        CorrelatedFlow.objects.create(
+            canonical_key="10.0.0.10:51515>10.0.0.11:443/p6",
+            client_ip="10.0.0.10",
+            server_ip="10.0.0.11",
+            client_port=51515,
+            server_port=443,
+            protocol=6,
+            flow_count=4,
+            c2s_packets=10,
+            c2s_bytes=1000,
+            s2c_packets=7,
+            s2c_bytes=400,
+            first_seen=now,
+            last_seen=now,
+            action_counts={"ACCEPT": 4},
+        )
+        CorrelatedFlow.objects.create(
+            canonical_key="10.0.0.12:5353>10.0.0.53:53/p17",
+            client_ip="10.0.0.12",
+            server_ip="10.0.0.53",
+            client_port=5353,
+            server_port=53,
+            protocol=17,
+            flow_count=2,
+            c2s_packets=3,
+            c2s_bytes=300,
+            s2c_packets=3,
+            s2c_bytes=500,
+            first_seen=now,
+            last_seen=now,
+            action_counts={"ACCEPT": 2},
+        )
+
+        response = self.client.get("/api/dashboard/summary/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["traffic"]["total_bytes"], 2200)
+        self.assertEqual(response.data["traffic"]["total_packets"], 23)
+        self.assertEqual(response.data["traffic"]["total_sessions"], 6)
+        self.assertGreaterEqual(len(response.data["protocol_breakdown"]), 2)
+        self.assertEqual(response.data["protocol_breakdown"][0]["protocol"], 6)
+        self.assertEqual(response.data["protocol_breakdown"][0]["bytes"], 1400)
 
 
 class EnvAccountAuthTests(APITestCase):
