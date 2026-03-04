@@ -155,6 +155,20 @@ You can also run with Docker Compose:
 docker compose up --build
 ```
 
+Production-style Compose (pull app image from GHCR + run PostgreSQL):
+
+```bash
+export POSTGRES_PASSWORD='change-me'
+docker compose -f docker-compose.prod.yml up -d
+```
+
+Optional overrides:
+
+- `APP_IMAGE` (defaults to `ghcr.io/jbhoorasingh/aws-vpc-flow-logs-visualizer:latest`)
+- `APP_PORT` (defaults to `8000`)
+- `DJANGO_ALLOWED_HOSTS`
+- `WRITE_ACCOUNT` / `READ_ACCOUNT` (format: `username:password`)
+
 ## GitHub Container Registry (GHCR)
 
 This repo includes `.github/workflows/container.yml`, which builds and publishes:

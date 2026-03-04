@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vpc-flow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vpc_flow_logs}
+      POSTGRES_USER: ${POSTGRES_USER:-vpc_flow_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in your environment or .env file}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - app_net
+
+  app:
+    image: ${APP_IMAGE:-ghcr.io/jbhoorasingh/aws-vpc-flow-logs-visualizer:latest}
+    container_name: vpc-flow-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      DJANGO_DEBUG: "false"
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-*}
+      CORS_ALLOW_ALL_ORIGINS: ${CORS_ALLOW_ALL_ORIGINS:-false}
+      DJANGO_DATABASE_URL: postgresql://${POSTGRES_USER:-vpc_flow_app}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-vpc_flow_logs}
+      # Optional API basic-auth accounts (format: username:password)
+      WRITE_ACCOUNT: ${WRITE_ACCOUNT:-}
+      READ_ACCOUNT: ${READ_ACCOUNT:-}
+    networks:
+      - app_net
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  app_net:
+    driver: bridge

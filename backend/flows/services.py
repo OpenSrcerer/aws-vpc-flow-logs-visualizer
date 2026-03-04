@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from heapq import nlargest
 from typing import Iterable
 
-from django.db import transaction
+from django.db import connection, transaction
 
 from .models import CorrelatedFlow, FlowLogEntry, IpMetadata, NetworkGroup
 from .parsers import ParsedFlowRecord
@@ -29,6 +29,12 @@ KNOWN_SERVER_PORTS = {
 }
 FIREWALL_SIM_GROUP_TAG = "firewall-simulator"
 FIREWALL_SIM_SOURCE_PREFIX = "[FIREWALL_SIM_SOURCE]"
+SQLITE_IN_CLAUSE_LIMIT = 900
+
+
+def _iter_chunks(items: list[str], size: int) -> Iterable[list[str]]:
+    for index in range(0, len(items), size):
+        yield items[index:index + size]
 
 
 def _iter_flows(flows: Iterable[CorrelatedFlow], *, chunk_size: int = 2000):
@@ -195,7 +201,13 @@ def upsert_correlated_flows(entries: Iterable[FlowLogEntry]) -> dict[str, int]:
         return {"created": 0, "updated": 0}
 
     keys = list(aggregated.keys())
-    existing = {item.canonical_key: item for item in CorrelatedFlow.objects.filter(canonical_key__in=keys)}
+    existing: dict[str, CorrelatedFlow] = {}
+    if connection.vendor == "sqlite":
+        for key_chunk in _iter_chunks(keys, SQLITE_IN_CLAUSE_LIMIT):
+            for item in CorrelatedFlow.objects.filter(canonical_key__in=key_chunk):
+                existing[item.canonical_key] = item
+    else:
+        existing = {item.canonical_key: item for item in CorrelatedFlow.objects.filter(canonical_key__in=keys)}
 
     to_create: list[CorrelatedFlow] = []
     to_update: list[CorrelatedFlow] = []

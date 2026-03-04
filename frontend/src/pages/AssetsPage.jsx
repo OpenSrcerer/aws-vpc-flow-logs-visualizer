@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ipaddr from "ipaddr.js";
 import { api, extractResults } from "../lib/api";
 import HierarchySidebar from "../components/assets/HierarchySidebar";
@@ -58,6 +58,8 @@ export default function AssetsPage() {
   const [selectedKey, setSelectedKey] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [loadProgress, setLoadProgress] = useState({ done: 0, total: 3 });
+  const didInitFetchRef = useRef(false);
 
   const mergedAssets = useMemo(() => {
     const metadataByIp = new Set(
@@ -122,11 +124,20 @@ export default function AssetsPage() {
   const fetchData = useCallback(async () => {
     setLoading(true);
     setError("");
+    setLoadProgress({ done: 0, total: 3 });
+
+    const track = (promise) =>
+      promise.finally(() => {
+        setLoadProgress((current) => ({
+          ...current,
+          done: Math.min(current.total, current.done + 1),
+        }));
+      });
 
     const [metaRes, groupsRes, meshRes] = await Promise.allSettled([
-      api.listIpMetadata(),
-      api.listNetworkGroups(),
-      api.getMesh(),
+      track(api.listIpMetadata()),
+      track(api.listNetworkGroups()),
+      track(api.getMesh()),
     ]);
 
     const errors = [];
@@ -178,6 +189,8 @@ export default function AssetsPage() {
   }, []);
 
   useEffect(() => {
+    if (didInitFetchRef.current) return;
+    didInitFetchRef.current = true;
     fetchData();
   }, [fetchData]);
 
@@ -247,8 +260,28 @@ export default function AssetsPage() {
         )}
 
         {loading ? (
-          <div className="flex-1 flex items-center justify-center text-slate-400 text-sm">
-            Loading assets...
+          <div className="flex-1 flex items-center justify-center px-4">
+            <div className="w-full max-w-lg rounded-xl border border-neutral-200 bg-white shadow-sm px-4 py-3">
+              <div className="flex items-center gap-2 text-slate-600">
+                <span className="inline-flex items-center justify-center rounded-full bg-primary/10 text-primary p-1">
+                  <span className="material-symbols-outlined animate-spin" style={{ fontSize: 16 }}>
+                    progress_activity
+                  </span>
+                </span>
+                <span className="text-sm font-medium">Loading assets and topology data...</span>
+              </div>
+              <div className="mt-2 h-2 w-full rounded-full bg-neutral-100 overflow-hidden">
+                <div
+                  className="h-full bg-primary transition-all duration-300"
+                  style={{
+                    width: `${loadProgress.total > 0 ? Math.round((loadProgress.done / loadProgress.total) * 100) : 0}%`,
+                  }}
+                />
+              </div>
+              <p className="mt-1 text-[11px] text-slate-400">
+                {loadProgress.done}/{loadProgress.total} data sources loaded
+              </p>
+            </div>
           </div>
         ) : (
           <div className="flex-1 min-h-0">
